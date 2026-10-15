@@ -110,6 +110,13 @@
   }
   .feed .row span { color: var(--text-dim); font-size: 14px; }
   .feed .empty { padding: 12px; color: var(--text-dim); font-size: 15px; }
+  .plate-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin: 16px 2px 6px 2px; }
+  .plate-head h3 { margin: 0; }
+  .plate-head button { min-height: 40px; padding: 0 12px; font-size: 14px; border: 2px solid var(--text); }
+  .plate-head button.on { background: var(--accent); color: #ffffff; }
+  #plateState { font-size: 14px; font-weight: 600; color: var(--text-dim); margin: 0 2px 8px 2px; }
+  #plateState.bad { color: var(--bad); }
+  #radar { cursor: pointer; }
 
   #dock {
     position: fixed; left: 0; right: 0; bottom: 0; height: var(--dock-h); z-index: 1000;
@@ -220,7 +227,8 @@
 
   <canvas id="trace"></canvas>
 
-  <h3>Latest plates</h3>
+  <div class="plate-head"><h3>Latest plates</h3><button class="secondary" id="parkedBtn">READ WHILE PARKED</button></div>
+  <div id="plateState">Plate reader starts with the drive.</div>
   <div class="feed" id="plateFeed"><div class="empty">Plates show up here as they are read.</div></div>
 </main>
 
@@ -488,7 +496,8 @@ const S = {
   win: [], spec: [], trace: [],
   jit: { prev: null, shifts: [], last: 0 },
   frames: [], lastFrameGrab: 0, photoTimes: [], lastBump: 0,
-  plates: 0, recentPlates: new Map(), worker: null, workerReady: false, plateBusy: false, lastPlate: 0
+  plates: 0, recentPlates: new Map(), worker: null, workerReady: false, workerError: null, plateBusy: false, lastPlate: 0, checks: 0, found: 0,
+  lastUpload: null, uploadError: null
 };
 
 // ---------- motion ----------
@@ -504,15 +513,15 @@ function onMotion(e) {
   const gm = Math.hypot(S.g[0], S.g[1], S.g[2]) || G;
   const vert = ((v[0] - S.g[0]) * S.g[0] + (v[1] - S.g[1]) * S.g[1] + (v[2] - S.g[2]) * S.g[2]) / gm / G;
   S.win.push(vert); S.spec.push(vert); S.trace.push(vert);
-  if (S.spec.length > 256) S.spec.splice(0, S.spec.length - 256);
-  if (S.trace.length > 1200) S.trace.splice(0, S.trace.length - 1200);
+  if (S.spec.length > 512) S.spec.splice(0, S.spec.length - 512);
+  if (S.trace.length > 2400) S.trace.splice(0, S.trace.length - 2400);
   S.motionCount++;
   if (!S.motionT0) S.motionT0 = now;
   if (now - S.motionT0 > 2000) { S.motionRate = S.motionCount * 1000 / (now - S.motionT0); S.motionCount = 0; S.motionT0 = now; }
   if (Math.abs(vert) > CFG.bumpG) onBump(Math.abs(vert));
 }
 
-// Strongest shake frequency between 1 and half the sample rate, from the last 256 readings.
+// Strongest shake frequency between 1 and half the sample rate, from the last 512 readings.
 function dominantHz(x, rate) {
   const N = 1 << Math.floor(Math.log2(x.length));
   if (N < 64 || !rate) return 0;
@@ -655,12 +664,13 @@ function startWorker() {
 }
 function onWorker(e) {
   const m = e.data;
-  if (m.type === 'ready') { S.workerReady = true; return; }
-  if (m.type === 'error') { S.plateBusy = false; console.warn('plate reader', m.message); return; }
+  if (m.type === 'ready') { S.workerReady = true; S.workerError = null; paintPlateState(); return; }
+  if (m.type === 'error') { S.plateBusy = false; if (!S.workerReady) S.workerError = m.message; paintPlateState(); return; }
   if (!plateJob || m.id !== plateJob.id) return;
   if (m.type === 'boxes') {
     const j = plateJob;
     j.boxes = m.boxes.slice(0, 4);
+    S.checks++; if (j.boxes.length) S.found++;
     drawBoxes(j);
     if (!j.boxes.length) { S.plateBusy = false; return; }
     const out = new Uint8Array(j.boxes.length * 64 * 128 * 3);
@@ -679,6 +689,23 @@ function onWorker(e) {
     m.reads.forEach((r) => { if (r.text.length >= 4 && r.conf >= 0.7) onPlate(r.text, r.conf); });
   }
 }
+// One line under Latest plates says exactly what the plate reader is doing right now.
+function paintPlateState() {
+  const el = $('plateState');
+  let t = '', bad = false;
+  if (!CFG.readPlates) t = 'Plate reading is off in settings.';
+  else if (!S.on) t = 'Plate reader starts with the drive.';
+  else if (S.workerError) { t = 'Plate reader did not load: ' + S.workerError; bad = true; }
+  else if (!S.workerReady) t = 'Loading the plate reader, about 11 MB the first time.';
+  else if (!CFG.readParked && S.mph < CFG.minMph) t = 'Paused until ' + CFG.minMph + ' mph. Press read while parked to test now.';
+  else t = 'Reading. ' + S.checks + ' frames checked, plates found in ' + S.found + '.';
+  el.textContent = t; el.className = bad ? 'bad' : '';
+  const b = $('parkedBtn');
+  b.textContent = CFG.readParked ? 'PARKED READING ON' : 'READ WHILE PARKED';
+  b.classList.toggle('on', !!CFG.readParked);
+}
+$('parkedBtn').onclick = () => { CFG.readParked = !CFG.readParked; saveCfg(); if (S.on && CFG.readPlates) startWorker(); paintPlateState(); };
+
 function plateTick(now) {
   if (!CFG.readPlates || !S.workerReady || S.plateBusy) return;
   if (now - S.lastPlate < 1000 / CFG.plateRate) return;
@@ -785,8 +812,8 @@ function secondTick() {
   $('gSpace').textContent = spacing == null ? '0' : spacing.toFixed(1);
   $('gJit').textContent = jit.px.toFixed(1);
   const mins = Math.floor((Date.now() - S.startedAt) / 60000);
-  setStatus('Driving ' + mins + ' min' + (S.motionRate ? ', motion ' + Math.round(S.motionRate) + ' per s' : ', waiting on motion') + (S.pos ? '' : ', waiting on location') +
-    (CFG.readPlates ? (S.workerReady ? '' : ', loading plate reader') : ''));
+  setStatus('Driving ' + mins + ' min' + (S.motionRate ? ', motion ' + Math.round(S.motionRate) + ' per s' : ', waiting on motion') + (S.pos ? '' : ', waiting on location') + ', ' + uploadNote());
+  paintPlateState();
 }
 function roughClass(r) { return r < 0.06 ? 'rough-ok' : r < 0.14 ? 'rough-mid' : 'rough-bad'; }
 function roughColor(r) { return r < 0.06 ? '#17694f' : r < 0.14 ? '#b86e00' : '#b3261e'; }
@@ -845,7 +872,7 @@ async function startDrive() {
   window.addEventListener('devicemotion', onMotion);
   if (navigator.geolocation) S.geoWatch = navigator.geolocation.watchPosition(onPos, () => {}, { enableHighAccuracy: true, maximumAge: 1000, timeout: 20000 });
   await keepAwake();
-  S.on = true; S.trip = uid('t'); S.startedAt = Date.now(); S.plates = 0;
+  S.on = true; S.trip = uid('t'); S.startedAt = Date.now(); S.plates = 0; S.checks = 0; S.found = 0;
   S.g = null; S.win = []; S.spec = []; S.trace = []; S.jit = { prev: null, shifts: [], last: 0 }; S.frames = [];
   $('gPlates').textContent = '0';
   if (CFG.readPlates) startWorker();
@@ -877,9 +904,17 @@ document.addEventListener('visibilitychange', () => { if (S.on && document.visib
 $('startBtn').onclick = () => (S.on ? stopDrive() : startDrive());
 
 async function paintIdle() {
+  paintPlateState();
   if (S.on) return;
   const n = (await qCount('samples')) + (await qCount('plates')) + (await qCount('bumps'));
-  setStatus((USER ? 'Signed in' : 'Not signed in') + (n ? ', ' + n + ' readings waiting to upload' : ', nothing waiting'));
+  setStatus((USER ? 'Signed in' : 'Not signed in') + (n ? ', ' + n + ' readings waiting' : ', nothing waiting') + ', ' + uploadNote());
+}
+function clock(t) { return new Date(t).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' }); }
+function uploadNote() {
+  if (!USER) return 'sign in to upload';
+  if (S.uploadError) return 'upload failed ' + clock(S.uploadError.at);
+  if (S.lastUpload) return 'uploaded ' + clock(S.lastUpload.at);
+  return 'first upload within a minute';
 }
 
 // ---------- uploads ----------
@@ -918,9 +953,12 @@ async function uploadNow(manual) {
       }
     }
     radar(capped ? 0 : 4);
+    S.uploadError = null;
+    S.lastUpload = { at: Date.now(), sent, capped, total: (S.lastUpload ? S.lastUpload.total : 0) + sent };
     if (manual) toast(capped ? 'Data limit reached. Readings keep saving on this phone until the limit resets.' : sent ? 'Uploaded ' + sent + ' items.' : 'Nothing waiting.');
   } catch (e) {
     radar(0);
+    S.uploadError = { at: Date.now(), message: String(e.message || e) };
     if (manual) toast('Upload failed: ' + (e.message || e) + '. It tries again next minute.');
   } finally {
     uploading = false;
@@ -928,6 +966,7 @@ async function uploadNow(manual) {
   }
 }
 function radar(n) { [...$('radar').children].forEach((d, i) => d.classList.toggle('on', i < n)); }
+$('radar').onclick = () => dataPanel();
 setInterval(() => uploadNow(false), Math.max(30, CFG.uploadEvery) * 1000);
 window.addEventListener('online', () => uploadNow(false));
 $('uploadBtn').onclick = () => { openMenu(false); uploadNow(true); };
@@ -1036,19 +1075,29 @@ async function dataPanel() {
   const dayPct = Math.min(100, m.dayBytes / (CFG.dayCapMb * 1e6) * 100);
   const monPct = Math.min(100, m.monthBytes / (CFG.monthCapMb * 1e6) * 100);
   const cs = await qCount('samples'), cp = await qCount('plates'), cb = await qCount('bumps'), cph = await qCount('photos');
-  let quota = '';
+  let quota = '', inAccount = '', recent = '';
   if (sb && USER && navigator.onLine) {
     try {
       const r = await sb.from('viridian_quota').select('kind,n').eq('day', today());
       if (r.data && r.data.length) quota = r.data.map((q) => q.kind.replace('viridian_', '') + ' ' + q.n).join(', ');
+      const c = await Promise.all(['samples', 'plates', 'bumps'].map((t) => sb.from('viridian_' + t).select('id', { count: 'exact', head: true })));
+      inAccount = c[0].count + ' seconds, ' + c[1].count + ' plates, ' + c[2].count + ' bumps';
+      const lp = await sb.from('viridian_plates').select('plate,at').order('at', { ascending: false }).limit(5);
+      if (lp.data && lp.data.length) recent = lp.data.map((x) => esc(x.plate) + ' ' + clock(x.at)).join(', ');
     } catch (e) {}
   }
+  const up = S.uploadError ? 'Failed at ' + clock(S.uploadError.at) + ': ' + esc(S.uploadError.message)
+    : S.lastUpload ? clock(S.lastUpload.at) + ', ' + S.lastUpload.sent + ' items' : USER ? 'None yet since the app opened' : 'Sign in to upload';
   openPanel('<h2>Data and limits</h2>' +
     '<div class="stat"><span>Sent today</span><b>' + fmtBytes(m.dayBytes) + ' of ' + CFG.dayCapMb + ' MB</b></div><div class="meter' + (dayPct >= 100 ? ' full' : '') + '"><div style="width:' + dayPct + '%"></div></div>' +
     '<div class="stat"><span>Sent this month</span><b>' + fmtBytes(m.monthBytes) + ' of ' + CFG.monthCapMb + ' MB</b></div><div class="meter' + (monPct >= 100 ? ' full' : '') + '"><div style="width:' + monPct + '%"></div></div>' +
     '<div class="stat"><span>Sent since install</span><b>' + fmtBytes(m.total) + '</b></div>' +
+    '<div class="stat"><span>Account</span><b>' + (USER ? esc(USER.email) : 'not signed in') + '</b></div>' +
+    '<div class="stat"><span>Last upload</span><b>' + up + '</b></div>' +
+    (inAccount ? '<div class="stat"><span>Saved in your account</span><b>' + inAccount + '</b></div>' : '') +
+    (recent ? '<div class="stat"><span>Newest plates in your account</span><b>' + recent + '</b></div>' : '') +
     '<div class="stat"><span>Waiting on this phone</span><b>' + cs + ' seconds, ' + cp + ' plates, ' + cb + ' bumps, ' + cph + ' photos</b></div>' +
-    (quota ? '<div class="stat"><span>Stored today in your account</span><b>' + esc(quota) + '</b></div>' : '') +
+    (quota ? '<div class="stat"><span>Added today</span><b>' + esc(quota) + '</b></div>' : '') +
     '<label for="capDay">Daily upload limit, MB</label><input id="capDay" type="number" min="1" max="2000" value="' + CFG.dayCapMb + '">' +
     '<label for="capMon">Monthly upload limit, MB</label><input id="capMon" type="number" min="1" max="20000" value="' + CFG.monthCapMb + '">' +
     '<label for="upEvery">Upload every, seconds</label><input id="upEvery" type="number" min="30" max="900" value="' + CFG.uploadEvery + '">' +
